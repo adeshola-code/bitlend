@@ -24,6 +24,18 @@
 ;; - 10% liquidation penalty
 ;; - 0.5% protocol fee on borrowing
 
+;; Token trait interface
+(define-trait token-trait
+  (
+    (transfer (string-ascii 42) uint principal principal (response bool uint))
+  ))
+
+;; Oracle trait interface
+(define-trait oracle-trait
+  (
+    (get-price (string-ascii 42) (response uint uint))
+  ))
+
 ;; Constants and Definitions
 (define-constant ERR_UNAUTHORIZED (err u1000))
 (define-constant ERR_INVALID_AMOUNT (err u1001))
@@ -44,6 +56,14 @@
 (define-constant LIQUIDATION_PENALTY u10) ;; 10% penalty
 (define-constant PROTOCOL_FEE u5) ;; 0.5% fee (percentage * 10)
 
+;; Protocol state variables
+(define-data-var protocol-paused bool false)
+(define-data-var protocol-owner principal tx-sender)
+(define-data-var next-loan-id uint u1)
+(define-data-var total-protocol-fees uint u0)
+;; FIX: Store principal instead of trait reference
+(define-data-var default-oracle-principal principal tx-sender)
+
 ;; Data Maps
 ;; Protocol control
 (define-map protocol-control 
@@ -54,7 +74,7 @@
 (define-map supported-assets 
   { asset-id: (string-ascii 42) } 
   { 
-    oracle-contract: principal,
+    oracle-principal: principal,
     oracle-function: (string-ascii 40),
     decimals: uint,
     active: bool,
@@ -87,15 +107,6 @@
   { user: principal }
   { loan-ids: (list 20 uint) })
 
-;; Protocol state
-(define-data-var protocol-paused bool false)
-(define-data-var protocol-owner principal tx-sender)
-(define-data-var next-loan-id uint u1)
-(define-data-var total-protocol-fees uint u0)
-
-;; Reference to price oracle contract
-(define-data-var default-oracle-contract principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.btc-oracle)
-
 ;; Read-only functions
 
 ;; Fetch protocol info
@@ -116,7 +127,7 @@
 (define-read-only (get-asset-info (asset-id (string-ascii 42)))
   (default-to 
     { 
-      oracle-contract: (var-get default-oracle-contract),
+      oracle-principal: (var-get default-oracle-principal),
       oracle-function: "get-price",
       decimals: u0,
       active: false,
@@ -125,12 +136,12 @@
     }
     (map-get? supported-assets { asset-id: asset-id })))
 
-;; Get asset price from oracle - fixed to use specific oracle contract
+;; Get asset price from oracle
 (define-read-only (get-asset-price (asset-id (string-ascii 42)))
   (let ((asset-info (get-asset-info asset-id)))
     (if (get active asset-info)
-      ;; Use a specific oracle contract rather than dynamic dispatch
-      (contract-call? .btc-oracle get-price asset-id)
+      ;; FIX: Contract-call using oracle-principal instead of trait reference
+      (contract-call? (unwrap-panic (contract-of (get oracle-principal asset-info))) get-price asset-id)
       (err ERR_ASSET_NOT_SUPPORTED))))
 
 ;; Get user's supplied balance
@@ -183,7 +194,7 @@
                   (* (/ collateral-value borrowed-value) u100)
                   u0)))
         (ok ratio))
-      (err ERR_ASSET_NOT_SUPPORTED))))
+      (err ERR_ORACLE_ERROR))))
 
 ;; Check if a loan is liquidatable
 (define-read-only (is-loan-liquidatable (loan-id uint))
@@ -205,8 +216,6 @@
      (interest-factor (+ u10000 (* interest-per-block blocks-elapsed)))
      (accrued-amount (/ (* principal-amount interest-factor) u10000)))
     accrued-amount))
-
-;; Public functions
 
 ;; Supply assets to the protocol
 (define-public (supply-asset (asset-id (string-ascii 42)) (amount uint) (token-contract <token-trait>))
@@ -505,14 +514,14 @@
 ;; Admin functions
 
 ;; Add supported asset
-(define-public (add-supported-asset (asset-id (string-ascii 42)) (oracle-contract principal) (oracle-function (string-ascii 40)) (decimals uint))
+(define-public (add-supported-asset (asset-id (string-ascii 42)) (oracle-principal principal) (oracle-function (string-ascii 40)) (decimals uint))
   (begin
     (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
     
     (map-set supported-assets
       { asset-id: asset-id }
       {
-        oracle-contract: oracle-contract,
+        oracle-principal: oracle-principal,
         oracle-function: oracle-function,
         decimals: decimals,
         active: true,
@@ -548,11 +557,11 @@
     (var-set protocol-paused paused)
     (ok true)))
 
-;; Set default oracle contract
-(define-public (set-default-oracle (oracle-contract principal))
+;; Set default oracle principal
+(define-public (set-default-oracle (oracle-principal principal))
   (begin
     (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
-    (var-set default-oracle-contract oracle-contract)
+    (var-set default-oracle-principal oracle-principal)
     (ok true)))
 
 ;; Withdraw protocol fees
@@ -568,17 +577,4 @@
                     asset-id
                     amount
                     (as-contract tx-sender)
-                    (var-get protocol-owner)))
-  ))
-
-;; Token trait interface
-(define-trait token-trait
-  (
-    (transfer (string-ascii 42) uint principal principal (response bool uint))
-  ))
-
-;; Oracle trait interface
-(define-trait oracle-trait
-  (
-    (get-price (string-ascii 42) (response uint uint))
-  ))
+                    (var-get protocol-owner)))))
