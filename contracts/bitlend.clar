@@ -328,3 +328,80 @@
                     ERR_BELOW_MIN_COLLATERAL_RATIO)))
               ERR_ASSET_NOT_SUPPORTED)))
       error (err error))))
+
+;; Repay loan (partial or full)
+(define-public (repay-loan (loan-id uint) (repay-amount uint))
+  (let*
+    ((loan (get-loan loan-id))
+     (borrowed-info (get-asset-info (get borrowed-asset loan)))
+     (current-height block-height)
+     (blocks-elapsed (- current-height (get last-update-height loan)))
+     (accrued-amount (calculate-accrued-amount (get borrowed-amount loan) (get interest-rate loan) blocks-elapsed))
+     (actual-repay-amount (if (> repay-amount accrued-amount) accrued-amount repay-amount))
+     (fee-amount (/ (* actual-repay-amount PROTOCOL_FEE) u1000)))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! (> repay-amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer repayment amount to contract
+    (match (contract-call? .token-trait transfer 
+                          (get borrowed-asset loan) 
+                          actual-repay-amount 
+                          tx-sender 
+                          (as-contract tx-sender))
+      success
+        (begin
+          ;; Update loan details
+          (let
+            ((remaining-borrowed (- accrued-amount actual-repay-amount)))
+            
+            ;; Update protocol fee accounting
+            (var-set total-protocol-fees (+ (var-get total-protocol-fees) fee-amount))
+            
+            ;; If fully repaid, close the loan and return collateral
+            (if (<= remaining-borrowed u0)
+              (begin
+                ;; Update loan status
+                (map-set loans
+                  { loan-id: loan-id }
+                  (merge loan { 
+                    borrowed-amount: u0,
+                    last-update-height: current-height,
+                    active: false
+                  }))
+                
+                ;; Update asset totals
+                (map-set supported-assets
+                  { asset-id: (get borrowed-asset loan) }
+                  (merge borrowed-info { 
+                    total-borrowed: (- (get total-borrowed borrowed-info) (get borrowed-amount loan)) 
+                  }))
+                
+                ;; Return collateral to borrower
+                (as-contract
+                  (contract-call? .token-trait transfer 
+                                (get collateral-asset loan) 
+                                (get collateral-amount loan) 
+                                (as-contract tx-sender) 
+                                (get borrower loan))))
+              
+              ;; Partial repayment - update loan amount
+              (begin
+                (map-set loans
+                  { loan-id: loan-id }
+                  (merge loan { 
+                    borrowed-amount: remaining-borrowed,
+                    last-update-height: current-height
+                  }))
+                
+                ;; Update asset totals for partial repayment
+                (map-set supported-assets
+                  { asset-id: (get borrowed-asset loan) }
+                  (merge borrowed-info { 
+                    total-borrowed: (+ (- (get total-borrowed borrowed-info) (get borrowed-amount loan)) remaining-borrowed) 
+                  }))))
+            
+            (ok true)))
+      error (err error))))
