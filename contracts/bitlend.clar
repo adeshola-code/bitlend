@@ -492,3 +492,76 @@
           
           (ok true))
       error (err error))))
+
+;; Admin functions
+
+;; Add supported asset
+(define-public (add-supported-asset (asset-id (string-ascii 42)) (oracle-contract principal) (decimals uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    
+    (map-set supported-assets
+      { asset-id: asset-id }
+      {
+        oracle-contract: oracle-contract,
+        decimals: decimals,
+        active: true,
+        total-supplied: u0,
+        total-borrowed: u0
+      })
+    
+    (ok true)))
+
+;; Update asset status (active/inactive)
+(define-public (set-asset-active (asset-id (string-ascii 42)) (active bool))
+  (let ((asset-info (get-asset-info asset-id)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+      
+      (map-set supported-assets
+        { asset-id: asset-id }
+        (merge asset-info { active: active }))
+      
+      (ok true))))
+
+;; Update protocol owner
+(define-public (set-protocol-owner (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set protocol-owner new-owner)
+    (ok true)))
+
+;; Pause/unpause protocol
+(define-public (set-protocol-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set protocol-paused paused)
+    (ok true)))
+
+;; Withdraw protocol fees
+(define-public (withdraw-protocol-fees (asset-id (string-ascii 42)) (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (asserts! (<= amount (var-get total-protocol-fees)) ERR_INVALID_AMOUNT)
+    
+    (var-set total-protocol-fees (- (var-get total-protocol-fees) amount))
+    
+    (as-contract
+      (contract-call? .token-trait transfer 
+                    asset-id
+                    amount
+                    (as-contract tx-sender)
+                    (var-get protocol-owner)))
+  ))
+
+;; Token trait interface for reference
+(define-trait token-trait
+  (
+    (transfer (string-ascii 42) uint principal principal (response bool uint))
+  ))
+
+;; Oracle trait interface for reference
+(define-trait oracle-trait
+  (
+    (get-price (string-ascii 42) (response uint uint))
+  ))
