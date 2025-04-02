@@ -153,3 +153,78 @@
       active: false
     }
     (map-get? loans { loan-id: loan-id })))
+
+;; Calculate collateral ratio for a loan
+(define-read-only (calculate-collateral-ratio (loan-id uint))
+  (let* 
+    ((loan (get-loan loan-id))
+     (collateral-price-response (get-asset-price (get collateral-asset loan)))
+     (borrowed-price-response (get-asset-price (get borrowed-asset loan)))
+     (collateral-decimals (get decimals (get-asset-info (get collateral-asset loan))))
+     (borrowed-decimals (get decimals (get-asset-info (get borrowed-asset loan)))))
+    
+    (if (and (is-ok collateral-price-response) (is-ok borrowed-price-response))
+      (let*
+        ((collateral-price (unwrap-panic collateral-price-response))
+         (borrowed-price (unwrap-panic borrowed-price-response))
+         (collateral-value-raw (* (get collateral-amount loan) collateral-price))
+         (borrowed-value-raw (* (get borrowed-amount loan) borrowed-price))
+         ;; Adjust for decimal differences and calculate ratio
+         (collateral-value (/ collateral-value-raw (pow u10 collateral-decimals)))
+         (borrowed-value (/ borrowed-value-raw (pow u10 borrowed-decimals)))
+         (ratio (if (> borrowed-value u0)
+                  (* (/ collateral-value borrowed-value) u100)
+                  u0)))
+        (ok ratio))
+      (err ERR_ASSET_NOT_SUPPORTED))))
+
+;; Check if a loan is liquidatable
+(define-read-only (is-loan-liquidatable (loan-id uint))
+  (let ((ratio-response (calculate-collateral-ratio loan-id)))
+    (if (is-ok ratio-response)
+      (let ((ratio (unwrap-panic ratio-response)))
+        (< ratio LIQUIDATION_THRESHOLD))
+      false)))
+
+;; Check if user's address matches expected
+(define-read-only (is-authorized (expected principal) (actual principal))
+  (or (is-eq expected actual)
+      (is-eq expected (var-get protocol-owner))))
+
+;; Calculate amount with accrued interest
+(define-read-only (calculate-accrued-amount (principal-amount uint) (interest-rate uint) (blocks-elapsed uint))
+  (let*
+    ((interest-per-block (/ interest-rate u10000)) ;; Convert basis points to per-block rate
+     (interest-factor (+ u10000 (* interest-per-block blocks-elapsed)))
+     (accrued-amount (/ (* principal-amount interest-factor) u10000)))
+    accrued-amount))
+
+;; Public functions
+
+;; Supply assets to the protocol
+(define-public (supply-asset (asset-id (string-ascii 42)) (amount uint))
+  (let
+    ((asset-info (get-asset-info asset-id))
+     (current-supply (get amount (get-user-supply tx-sender asset-id))))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active asset-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer asset to contract
+    (match (contract-call? .token-trait transfer asset-id amount tx-sender (as-contract tx-sender))
+      success
+        (begin
+          ;; Update user's supply balance
+          (map-set user-supplies 
+            { user: tx-sender, asset-id: asset-id }
+            { amount: (+ current-supply amount) })
+          
+          ;; Update asset totals
+          (map-set supported-assets
+            { asset-id: asset-id }
+            (merge asset-info { total-supplied: (+ (get total-supplied asset-info) amount) }))
+          
+          (ok true))
+      error (err error))))
