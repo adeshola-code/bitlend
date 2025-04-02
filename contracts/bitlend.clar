@@ -36,6 +36,7 @@
 (define-constant ERR_PROTOCOL_PAUSED (err u1008))
 (define-constant ERR_ASSET_NOT_SUPPORTED (err u1009))
 (define-constant ERR_INSUFFICIENT_LIQUIDITY (err u1010))
+(define-constant ERR_ORACLE_ERROR (err u1011))
 
 ;; 80% collateral requirement - 125% minimum collateral ratio
 (define-constant MIN_COLLATERAL_RATIO u125) ;; percentage * 100
@@ -54,6 +55,7 @@
   { asset-id: (string-ascii 42) } 
   { 
     oracle-contract: principal,
+    oracle-function: (string-ascii 40),
     decimals: uint,
     active: bool,
     total-supplied: uint,
@@ -91,6 +93,9 @@
 (define-data-var next-loan-id uint u1)
 (define-data-var total-protocol-fees uint u0)
 
+;; Reference to price oracle contract
+(define-data-var default-oracle-contract principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.btc-oracle)
+
 ;; Read-only functions
 
 ;; Fetch protocol info
@@ -111,7 +116,8 @@
 (define-read-only (get-asset-info (asset-id (string-ascii 42)))
   (default-to 
     { 
-      oracle-contract: 'ST000000000000000000002AMW42H.fake-oracle,
+      oracle-contract: (var-get default-oracle-contract),
+      oracle-function: "get-price",
       decimals: u0,
       active: false,
       total-supplied: u0,
@@ -119,11 +125,12 @@
     }
     (map-get? supported-assets { asset-id: asset-id })))
 
-;; Get asset price from oracle
+;; Get asset price from oracle - fixed to use specific oracle contract
 (define-read-only (get-asset-price (asset-id (string-ascii 42)))
   (let ((asset-info (get-asset-info asset-id)))
     (if (get active asset-info)
-      (contract-call? (get oracle-contract asset-info) get-price asset-id)
+      ;; Use a specific oracle contract rather than dynamic dispatch
+      (contract-call? .btc-oracle get-price asset-id)
       (err ERR_ASSET_NOT_SUPPORTED))))
 
 ;; Get user's supplied balance
@@ -202,7 +209,7 @@
 ;; Public functions
 
 ;; Supply assets to the protocol
-(define-public (supply-asset (asset-id (string-ascii 42)) (amount uint))
+(define-public (supply-asset (asset-id (string-ascii 42)) (amount uint) (token-contract <token-trait>))
   (let
     ((asset-info (get-asset-info asset-id))
      (current-supply (get amount (get-user-supply tx-sender asset-id))))
@@ -213,7 +220,7 @@
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     
     ;; Transfer asset to contract
-    (match (contract-call? .token-trait transfer asset-id amount tx-sender (as-contract tx-sender))
+    (match (contract-call? token-contract transfer asset-id amount tx-sender (as-contract tx-sender))
       success
         (begin
           ;; Update user's supply balance
@@ -230,7 +237,7 @@
       error (err error))))
 
 ;; Withdraw supplied assets
-(define-public (withdraw-asset (asset-id (string-ascii 42)) (amount uint))
+(define-public (withdraw-asset (asset-id (string-ascii 42)) (amount uint) (token-contract <token-trait>))
   (let
     ((asset-info (get-asset-info asset-id))
      (current-supply (get amount (get-user-supply tx-sender asset-id))))
@@ -253,14 +260,16 @@
     
     ;; Transfer asset from contract to user
     (as-contract
-      (contract-call? .token-trait transfer asset-id amount tx-sender tx-sender))))
+      (contract-call? token-contract transfer asset-id amount tx-sender tx-sender))))
 
 ;; Create a new loan
 (define-public (create-loan 
   (collateral-asset (string-ascii 42))
   (collateral-amount uint)
   (borrowed-asset (string-ascii 42))
-  (borrow-amount uint))
+  (borrow-amount uint)
+  (collateral-token <token-trait>)
+  (borrowed-token <token-trait>))
   
   (let
     ((collateral-info (get-asset-info collateral-asset))
@@ -279,7 +288,7 @@
     (asserts! (>= (- (get total-supplied borrowed-info) (get total-borrowed borrowed-info)) borrow-amount) ERR_INSUFFICIENT_LIQUIDITY)
     
     ;; Transfer collateral to contract
-    (match (contract-call? .token-trait transfer collateral-asset collateral-amount tx-sender (as-contract tx-sender))
+    (match (contract-call? collateral-token transfer collateral-asset collateral-amount tx-sender (as-contract tx-sender))
       success
         (begin
           ;; Create the loan
@@ -318,19 +327,19 @@
                 (if (>= ratio MIN_COLLATERAL_RATIO)
                   ;; Transfer borrowed asset to user
                   (as-contract
-                    (contract-call? .token-trait transfer borrowed-asset borrow-amount tx-sender tx-sender))
+                    (contract-call? borrowed-token transfer borrowed-asset borrow-amount tx-sender tx-sender))
                   (begin
                     ;; Revert loan creation if collateral ratio is too low
                     (map-delete loans { loan-id: loan-id })
                     ;; Return collateral to user
                     (as-contract
-                      (contract-call? .token-trait transfer collateral-asset collateral-amount tx-sender tx-sender))
+                      (contract-call? collateral-token transfer collateral-asset collateral-amount tx-sender tx-sender))
                     ERR_BELOW_MIN_COLLATERAL_RATIO)))
               ERR_ASSET_NOT_SUPPORTED)))
       error (err error))))
 
 ;; Repay loan (partial or full)
-(define-public (repay-loan (loan-id uint) (repay-amount uint))
+(define-public (repay-loan (loan-id uint) (repay-amount uint) (borrowed-token <token-trait>))
   (let*
     ((loan (get-loan loan-id))
      (borrowed-info (get-asset-info (get borrowed-asset loan)))
@@ -346,7 +355,7 @@
     (asserts! (> repay-amount u0) ERR_INVALID_AMOUNT)
     
     ;; Transfer repayment amount to contract
-    (match (contract-call? .token-trait transfer 
+    (match (contract-call? borrowed-token transfer 
                           (get borrowed-asset loan) 
                           actual-repay-amount 
                           tx-sender 
@@ -381,7 +390,7 @@
                 
                 ;; Return collateral to borrower
                 (as-contract
-                  (contract-call? .token-trait transfer 
+                  (contract-call? borrowed-token transfer 
                                 (get collateral-asset loan) 
                                 (get collateral-amount loan) 
                                 (as-contract tx-sender) 
@@ -407,7 +416,7 @@
       error (err error))))
 
 ;; Add collateral to existing loan
-(define-public (add-collateral (loan-id uint) (additional-amount uint))
+(define-public (add-collateral (loan-id uint) (additional-amount uint) (collateral-token <token-trait>))
   (let
     ((loan (get-loan loan-id)))
     
@@ -418,7 +427,7 @@
     (asserts! (> additional-amount u0) ERR_INVALID_AMOUNT)
     
     ;; Transfer additional collateral to contract
-    (match (contract-call? .token-trait transfer 
+    (match (contract-call? collateral-token transfer 
                           (get collateral-asset loan) 
                           additional-amount 
                           tx-sender 
@@ -436,7 +445,7 @@
       error (err error))))
 
 ;; Liquidate an undercollateralized loan
-(define-public (liquidate-loan (loan-id uint))
+(define-public (liquidate-loan (loan-id uint) (borrowed-token <token-trait>) (collateral-token <token-trait>))
   (let*
     ((loan (get-loan loan-id))
      (liquidatable (is-loan-liquidatable loan-id))
@@ -456,7 +465,7 @@
     (asserts! liquidatable ERR_LOAN_NOT_LIQUIDATABLE)
     
     ;; Transfer repayment amount from liquidator
-    (match (contract-call? .token-trait transfer 
+    (match (contract-call? borrowed-token transfer 
                           (get borrowed-asset loan) 
                           total-repay-amount
                           tx-sender 
@@ -484,7 +493,7 @@
           
           ;; Transfer collateral to liquidator
           (as-contract
-            (contract-call? .token-trait transfer 
+            (contract-call? collateral-token transfer 
                           (get collateral-asset loan) 
                           (get collateral-amount loan) 
                           (as-contract tx-sender) 
@@ -496,7 +505,7 @@
 ;; Admin functions
 
 ;; Add supported asset
-(define-public (add-supported-asset (asset-id (string-ascii 42)) (oracle-contract principal) (decimals uint))
+(define-public (add-supported-asset (asset-id (string-ascii 42)) (oracle-contract principal) (oracle-function (string-ascii 40)) (decimals uint))
   (begin
     (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
     
@@ -504,6 +513,7 @@
       { asset-id: asset-id }
       {
         oracle-contract: oracle-contract,
+        oracle-function: oracle-function,
         decimals: decimals,
         active: true,
         total-supplied: u0,
@@ -538,8 +548,15 @@
     (var-set protocol-paused paused)
     (ok true)))
 
+;; Set default oracle contract
+(define-public (set-default-oracle (oracle-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
+    (var-set default-oracle-contract oracle-contract)
+    (ok true)))
+
 ;; Withdraw protocol fees
-(define-public (withdraw-protocol-fees (asset-id (string-ascii 42)) (amount uint))
+(define-public (withdraw-protocol-fees (asset-id (string-ascii 42)) (amount uint) (token-contract <token-trait>))
   (begin
     (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR_UNAUTHORIZED)
     (asserts! (<= amount (var-get total-protocol-fees)) ERR_INVALID_AMOUNT)
@@ -547,20 +564,20 @@
     (var-set total-protocol-fees (- (var-get total-protocol-fees) amount))
     
     (as-contract
-      (contract-call? .token-trait transfer 
+      (contract-call? token-contract transfer 
                     asset-id
                     amount
                     (as-contract tx-sender)
                     (var-get protocol-owner)))
   ))
 
-;; Token trait interface for reference
+;; Token trait interface
 (define-trait token-trait
   (
     (transfer (string-ascii 42) uint principal principal (response bool uint))
   ))
 
-;; Oracle trait interface for reference
+;; Oracle trait interface
 (define-trait oracle-trait
   (
     (get-price (string-ascii 42) (response uint uint))
