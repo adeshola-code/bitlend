@@ -228,3 +228,103 @@
           
           (ok true))
       error (err error))))
+
+;; Withdraw supplied assets
+(define-public (withdraw-asset (asset-id (string-ascii 42)) (amount uint))
+  (let
+    ((asset-info (get-asset-info asset-id))
+     (current-supply (get amount (get-user-supply tx-sender asset-id))))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active asset-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (>= current-supply amount) ERR_INVALID_AMOUNT)
+    (asserts! (>= (- (get total-supplied asset-info) (get total-borrowed asset-info)) amount) ERR_INSUFFICIENT_LIQUIDITY)
+    
+    ;; Update user's supply balance
+    (map-set user-supplies 
+      { user: tx-sender, asset-id: asset-id }
+      { amount: (- current-supply amount) })
+    
+    ;; Update asset totals
+    (map-set supported-assets
+      { asset-id: asset-id }
+      (merge asset-info { total-supplied: (- (get total-supplied asset-info) amount) }))
+    
+    ;; Transfer asset from contract to user
+    (as-contract
+      (contract-call? .token-trait transfer asset-id amount tx-sender tx-sender))))
+
+;; Create a new loan
+(define-public (create-loan 
+  (collateral-asset (string-ascii 42))
+  (collateral-amount uint)
+  (borrowed-asset (string-ascii 42))
+  (borrow-amount uint))
+  
+  (let
+    ((collateral-info (get-asset-info collateral-asset))
+     (borrowed-info (get-asset-info borrowed-asset))
+     (loan-id (var-get next-loan-id))
+     (block-height block-height)
+     ;; Interest rate could be dynamic based on utilization, fixed at 5% APY (500 basis points) for simplicity
+     (interest-rate u500))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active collateral-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (get active borrowed-info) ERR_ASSET_NOT_SUPPORTED)
+    (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> borrow-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (- (get total-supplied borrowed-info) (get total-borrowed borrowed-info)) borrow-amount) ERR_INSUFFICIENT_LIQUIDITY)
+    
+    ;; Transfer collateral to contract
+    (match (contract-call? .token-trait transfer collateral-asset collateral-amount tx-sender (as-contract tx-sender))
+      success
+        (begin
+          ;; Create the loan
+          (map-set loans
+            { loan-id: loan-id }
+            {
+              borrower: tx-sender, 
+              collateral-asset: collateral-asset,
+              collateral-amount: collateral-amount,
+              borrowed-asset: borrowed-asset,
+              borrowed-amount: borrow-amount,
+              creation-height: block-height,
+              last-update-height: block-height,
+              interest-rate: interest-rate,
+              active: true
+            })
+          
+          ;; Update user's loan IDs
+          (let ((user-loan-list (get loan-ids (default-to { loan-ids: (list) } (map-get? user-loans { user: tx-sender })))))
+            (map-set user-loans
+              { user: tx-sender }
+              { loan-ids: (append user-loan-list loan-id) }))
+          
+          ;; Update asset totals
+          (map-set supported-assets
+            { asset-id: borrowed-asset }
+            (merge borrowed-info { total-borrowed: (+ (get total-borrowed borrowed-info) borrow-amount) }))
+          
+          ;; Increment loan ID counter
+          (var-set next-loan-id (+ loan-id u1))
+          
+          ;; Calculate collateral ratio to ensure it's above minimum required
+          (let ((ratio-response (calculate-collateral-ratio loan-id)))
+            (if (is-ok ratio-response)
+              (let ((ratio (unwrap-panic ratio-response)))
+                (if (>= ratio MIN_COLLATERAL_RATIO)
+                  ;; Transfer borrowed asset to user
+                  (as-contract
+                    (contract-call? .token-trait transfer borrowed-asset borrow-amount tx-sender tx-sender))
+                  (begin
+                    ;; Revert loan creation if collateral ratio is too low
+                    (map-delete loans { loan-id: loan-id })
+                    ;; Return collateral to user
+                    (as-contract
+                      (contract-call? .token-trait transfer collateral-asset collateral-amount tx-sender tx-sender))
+                    ERR_BELOW_MIN_COLLATERAL_RATIO)))
+              ERR_ASSET_NOT_SUPPORTED)))
+      error (err error))))
