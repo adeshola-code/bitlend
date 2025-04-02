@@ -405,3 +405,90 @@
             
             (ok true)))
       error (err error))))
+
+;; Add collateral to existing loan
+(define-public (add-collateral (loan-id uint) (additional-amount uint))
+  (let
+    ((loan (get-loan loan-id)))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! (is-eq (get borrower loan) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> additional-amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer additional collateral to contract
+    (match (contract-call? .token-trait transfer 
+                          (get collateral-asset loan) 
+                          additional-amount 
+                          tx-sender 
+                          (as-contract tx-sender))
+      success
+        (begin
+          ;; Update loan with new collateral amount
+          (map-set loans
+            { loan-id: loan-id }
+            (merge loan { 
+              collateral-amount: (+ (get collateral-amount loan) additional-amount)
+            }))
+          
+          (ok true))
+      error (err error))))
+
+;; Liquidate an undercollateralized loan
+(define-public (liquidate-loan (loan-id uint))
+  (let*
+    ((loan (get-loan loan-id))
+     (liquidatable (is-loan-liquidatable loan-id))
+     (collateral-asset-info (get-asset-info (get collateral-asset loan)))
+     (borrowed-asset-info (get-asset-info (get borrowed-asset loan)))
+     (current-height block-height)
+     (blocks-elapsed (- current-height (get last-update-height loan)))
+     (accrued-amount (calculate-accrued-amount (get borrowed-amount loan) (get interest-rate loan) blocks-elapsed))
+     ;; Calculate liquidation bonus - liquidator gets collateral at a discount
+     (penalty-amount (/ (* accrued-amount LIQUIDATION_PENALTY) u100))
+     (total-repay-amount (+ accrued-amount penalty-amount))
+     (fee-amount (/ (* accrued-amount PROTOCOL_FEE) u1000)))
+    
+    ;; Validation checks
+    (asserts! (not (var-get protocol-paused)) ERR_PROTOCOL_PAUSED)
+    (asserts! (get active loan) ERR_LOAN_NOT_FOUND)
+    (asserts! liquidatable ERR_LOAN_NOT_LIQUIDATABLE)
+    
+    ;; Transfer repayment amount from liquidator
+    (match (contract-call? .token-trait transfer 
+                          (get borrowed-asset loan) 
+                          total-repay-amount
+                          tx-sender 
+                          (as-contract tx-sender))
+      success
+        (begin
+          ;; Update protocol fee accounting
+          (var-set total-protocol-fees (+ (var-get total-protocol-fees) fee-amount))
+          
+          ;; Update loan status to inactive
+          (map-set loans
+            { loan-id: loan-id }
+            (merge loan { 
+              borrowed-amount: u0,
+              last-update-height: current-height,
+              active: false
+            }))
+          
+          ;; Update asset totals
+          (map-set supported-assets
+            { asset-id: (get borrowed-asset loan) }
+            (merge borrowed-asset-info { 
+              total-borrowed: (- (get total-borrowed borrowed-asset-info) (get borrowed-amount loan)) 
+            }))
+          
+          ;; Transfer collateral to liquidator
+          (as-contract
+            (contract-call? .token-trait transfer 
+                          (get collateral-asset loan) 
+                          (get collateral-amount loan) 
+                          (as-contract tx-sender) 
+                          tx-sender))
+          
+          (ok true))
+      error (err error))))
