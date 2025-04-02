@@ -79,3 +79,77 @@
     interest-rate: uint,
     active: bool
   })
+
+;; Track loan IDs by borrower
+(define-map user-loans
+  { user: principal }
+  { loan-ids: (list 20 uint) })
+
+;; Protocol state
+(define-data-var protocol-paused bool false)
+(define-data-var protocol-owner principal tx-sender)
+(define-data-var next-loan-id uint u1)
+(define-data-var total-protocol-fees uint u0)
+
+;; Read-only functions
+
+;; Fetch protocol info
+(define-read-only (get-protocol-info)
+  (let 
+    ((paused (var-get protocol-paused))
+     (owner (var-get protocol-owner))
+     (loan-count (- (var-get next-loan-id) u1))
+     (fees (var-get total-protocol-fees)))
+    {
+      paused: paused,
+      owner: owner,
+      loan-count: loan-count,
+      accumulated-fees: fees
+    }))
+
+;; Get asset details
+(define-read-only (get-asset-info (asset-id (string-ascii 42)))
+  (default-to 
+    { 
+      oracle-contract: 'ST000000000000000000002AMW42H.fake-oracle,
+      decimals: u0,
+      active: false,
+      total-supplied: u0,
+      total-borrowed: u0
+    }
+    (map-get? supported-assets { asset-id: asset-id })))
+
+;; Get asset price from oracle
+(define-read-only (get-asset-price (asset-id (string-ascii 42)))
+  (let ((asset-info (get-asset-info asset-id)))
+    (if (get active asset-info)
+      (contract-call? (get oracle-contract asset-info) get-price asset-id)
+      (err ERR_ASSET_NOT_SUPPORTED))))
+
+;; Get user's supplied balance
+(define-read-only (get-user-supply (user principal) (asset-id (string-ascii 42)))
+  (default-to 
+    { amount: u0 }
+    (map-get? user-supplies { user: user, asset-id: asset-id })))
+
+;; Get user's loans
+(define-read-only (get-user-loan-ids (user principal))
+  (default-to 
+    { loan-ids: (list) }
+    (map-get? user-loans { user: user })))
+
+;; Get loan details
+(define-read-only (get-loan (loan-id uint))
+  (default-to
+    {
+      borrower: 'ST000000000000000000002AMW42H,
+      collateral-asset: "",
+      collateral-amount: u0,
+      borrowed-asset: "",
+      borrowed-amount: u0,
+      creation-height: u0,
+      last-update-height: u0,
+      interest-rate: u0,
+      active: false
+    }
+    (map-get? loans { loan-id: loan-id })))
